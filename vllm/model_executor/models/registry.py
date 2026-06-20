@@ -433,6 +433,7 @@ _MULTIMODAL_MODELS = {
         "HunYuanVLForConditionalGeneration",
     ),
     "InternVLChatModel": ("internvl", "InternVLChatModel"),
+    "KTHInternvlChatModel": ("kth_internvl", "KTHInternvlChatModel"),
     "InternS1ForConditionalGeneration": (
         "interns1",
         "InternS1ForConditionalGeneration",
