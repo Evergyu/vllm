@@ -80,23 +80,67 @@ class PerTokenGate(nn.Module):
 
 
 class ContentAwareGate(nn.Module):
-    """Content-aware gate: g = sigmoid(W·mean_pool(base_tokens)).
-    이미지마다 다른 gate 값. OCR/문서/일반 분기 학습 가능."""
+    """[v10] Bounded content-aware gate:  g = sigmoid( τ·cos(w, LN(pool)) + b )
+
+    ── 왜 바꿨나 (v9 실측, 2026-07-14) ─────────────────────────────────────────
+    v9 게이트 sigmoid(W·mean_pool + b) 는 학습된 모델 3개 전부에서 완전 포화했다:
+        모델        bias    ‖W‖      로짓     실측 gate
+        KTH_720k    5.000    1.81    11.6      1.0000
+        v2_c        5.000   14.73    67.2      1.0000
+        v2_b        2.009    1.54    10.0      0.9999
+      로짓 최솟값 8.1 — 어떤 이미지에서도 gate 가 0.9997 아래로 내려간 적이 없다.
+      즉 content-aware 라우팅은 한 번도 일어나지 않았고 KTH 는 항상 100% 주입됐다.
+
+    원인:
+      (1) pool 노름이 커서 W·pool 이 +6~+62 까지 뜬다 (LN 부재)
+      (2) init_bias=5 → σ(5)=0.993. bias 만으로 이미 포화이고, 실측상 bias 는
+          학습으로 거의 안 움직인다 (5.000/5.000/2.009 = 초기값 그대로).
+      포화 구간 gradient ∝ g(1-g) ≈ 0.0066 → 게이트가 학습 신호를 못 받고,
+      W 는 표류하다 저수준 통계(타일 수/zoom, r=-0.735)에 정렬됐다.
+
+    ── v10: 포화를 '감시'하지 말고 '불가능'하게 ───────────────────────────────
+      z = τ·cos(w, LN(pool)) + b       cos ∈ [-1,1] → z ∈ [b-τ, b+τ] (구조적 보장)
+      τ=2, b=1.5 (둘 다 고정) → z ∈ [-0.5, 3.5], gate ∈ [0.38, 0.97]
+        · 초기 gate 0.82 : KTH 주입 유지(학습 효과 보존)
+        · 최소 gradient 0.03 : v9(0.0066)의 5배 → 게이트가 실제로 학습된다
+        · ‖w‖ 가 얼마든 무관(방향만 사용) → wd 튜닝 불필요, 재포화 불가능
+      loss 에 usage 항 없음: 학습분포에서 KTH ablate 시 CE 변화 +0.0005 라
+      CE 가 하한을 못 지킨다 → cap 을 걸면 게이트가 0 으로 붕괴한다.
+
+    판정: std(gate) > 0.05 → content-aware 최초 성립.
+          std(gate) < 0.02 가 200 step 지속 → 게이트 사망, 학습 중단.
+    env: GATE_TAU(2.0) GATE_BIAS_FIXED(1.5) GATE_LEGACY=1(v9 동작 폴백)
+    """
     def __init__(self, hidden_dim, init_bias=-3.0):
-        # init_bias=-3.0 → sigmoid(-3) ≈ 0.047 (현재 학습된 scalar gate와 비슷)
         super().__init__()
+        self.legacy = _gate_os.environ.get("GATE_LEGACY") == "1"
+        self.tau = float(_gate_os.environ.get("GATE_TAU", "2.0"))
+        self.bias_fixed = float(_gate_os.environ.get("GATE_BIAS_FIXED", "1.5"))
+
         self.proj = nn.Linear(hidden_dim, 1, bias=True)
-        nn.init.zeros_(self.proj.weight)
-        nn.init.constant_(self.proj.bias, init_bias)
-        # float32로 유지
+        if self.legacy:
+            nn.init.zeros_(self.proj.weight)
+            nn.init.constant_(self.proj.bias, init_bias)
+        else:
+            # 방향만 쓰이므로 랜덤 초기화. bias 는 미사용(고정 스칼라 b 로 대체)
+            nn.init.normal_(self.proj.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.proj.bias)
+            self.proj.bias.requires_grad_(False)
+            self.gate_ln = nn.LayerNorm(hidden_dim, elementwise_affine=False)
         self.proj.weight.data = self.proj.weight.data.float()
         self.proj.bias.data = self.proj.bias.data.float()
 
     def compute_gate(self, base_tokens):
-        # base_tokens: (B, N_base, D) → (B, 1, 1)
-        pooled = base_tokens.float().mean(dim=1)        # (B, D)
-        logit = self.proj(pooled)                        # (B, 1)
-        return torch.sigmoid(logit).unsqueeze(-1)        # (B, 1, 1)
+        # base_tokens: (B=타일, N_base=256, D) → (B, 1, 1)
+        pooled = base_tokens.float().mean(dim=1)             # (B, D)
+        if self.legacy:
+            return torch.sigmoid(self.proj(pooled)).unsqueeze(-1)
+
+        h = self.gate_ln(pooled)                             # 크기 정규화
+        w = self.proj.weight.float().squeeze(0)              # (D,)
+        cos = F.cosine_similarity(h, w.unsqueeze(0), dim=-1)  # (B,) ∈ [-1,1]
+        logit = self.tau * cos + self.bias_fixed             # ∈ [b-τ, b+τ]
+        return torch.sigmoid(logit).view(-1, 1, 1)           # (B, 1, 1)
 
     def forward(self, x, base_tokens=None):
         # x: (B, num_spatial_tokens, D)
@@ -193,7 +237,10 @@ class InternVLChatModel(PreTrainedModel):
         self.template = config.template
         self.downsample_ratio = config.downsample_ratio
         self.ps_version = config.ps_version
-        self.spatial_feature_mode = getattr(config, "spatial_feature_mode", "none")
+        _raw_sfm = getattr(config, "spatial_feature_mode", "none")
+        # 구버전 체크포인트 호환: 옛 llava_sp_* 이름 → koni_* 로 정규화 (KTH_720k 등 기존 config 로드용)
+        _SFM_ALIAS = {"llava_sp_both": "koni_token_hier", "llava_sp_pooling": "koni_pool", "llava_sp_cropping": "koni_crop"}
+        self.spatial_feature_mode = _SFM_ALIAS.get(_raw_sfm, _raw_sfm)
         self.spatial_pool_size = self._normalize_hw(
             getattr(config, "spatial_pool_size", None), "spatial_pool_size"
         )
@@ -318,14 +365,21 @@ class InternVLChatModel(PreTrainedModel):
             )
 
         # ── LLaVA-SP: SFE (Spatial Feature Extractor) + optional DFI ──
-        _LLAVA_SP_MODES = ("llava_sp_pooling", "llava_sp_cropping", "llava_sp_both")
-        if self.spatial_feature_mode in _LLAVA_SP_MODES:
+        _KONI_MODES = ("koni_pool", "koni_crop", "koni_token_hier")
+        if self.spatial_feature_mode in _KONI_MODES:
             pre_ps_grid = image_size // patch_size  # 32 for 448/14
             sfe_scales = self.sfe_scales or [4, 8, 14, 20, 26, pre_ps_grid]
             sfe_dim = self.sfe_intermediate_size  # 512
 
-            need_pooling = self.spatial_feature_mode in ("llava_sp_pooling", "llava_sp_both")
-            need_cropping = self.spatial_feature_mode in ("llava_sp_cropping", "llava_sp_both")
+            need_pooling = self.spatial_feature_mode in ("koni_pool", "koni_token_hier")
+            need_cropping = self.spatial_feature_mode in ("koni_crop", "koni_token_hier")
+
+            # ── [v10 local-branch fix] center-crop(동심원, 중앙편향) → dense windows ──
+            #   진단(2026-07-16): 기존 local은 항상 정중앙 k×k crop만 → 주변부 안 봄
+            #   (peripheryFrac 0.299), 보완장치 DFI는 inert. LOCAL_BRANCH env로 분기.
+            import os as _lb_os
+            self._local_mode = _lb_os.environ.get("LOCAL_BRANCH", "center_crop")
+            self._pre_ps_grid = pre_ps_grid
 
             def _build_sfe_convs():
                 convs = nn.ModuleList()
@@ -348,8 +402,8 @@ class InternVLChatModel(PreTrainedModel):
                     nn.GELU(), nn.Linear(sfe_dim, llm_hidden_size, bias=False)
                 )
 
-            # Cropping SFE + DFI
-            if need_cropping:
+            # Cropping SFE + DFI  (Control=center_crop) 또는 [v10] dense local windows
+            if need_cropping and self._local_mode == "center_crop":
                 self.sfe_crop_convs = _build_sfe_convs()
                 dk = self.dfi_detail_kernel
                 ds = self.dfi_detail_stride
@@ -369,13 +423,74 @@ class InternVLChatModel(PreTrainedModel):
                 self.sfe_crop_proj = nn.Sequential(
                     nn.GELU(), nn.Linear(sfe_dim * 2, llm_hidden_size, bias=False)
                 )
+            elif need_cropping and self._local_mode == "global_ca":
+                # [v10 E6] local도 전역 멀티스케일 pooling(pool과 동일 기계, 별도 가중치) + channel attn.
+                #   spatial attn은 안 씀 → 두 브랜치가 attention 종류(spatial vs channel)로만 구분.
+                #   "로컬 detail이 정말 필요한가 vs 전역 두 관점으로 충분한가" 검증. 6토큰.
+                self.local_pool_convs = _build_sfe_convs()
+                self.local_dense_proj = nn.Sequential(
+                    nn.GELU(), nn.Linear(sfe_dim, llm_hidden_size, bias=False)
+                )
+                logger.info(f'[v10] E6 global_ca local: 전역 pooling + channel attn, '
+                            f'local_tokens={self._local_token_count()}')
+            elif need_cropping and self._local_mode == "none":
+                # [v10 E7] pool-only: local branch 완전 제거(global 6토큰만). 아무 local 모듈도 안 지음.
+                #   "local이 애초에 도움되나"의 바닥선. tsa는 pool 6토큰 위에서만 돎.
+                logger.info('[v10] E7 pool-only: local branch 없음 (global 6토큰만)')
+            elif need_cropping and self._local_mode == "hybrid":
+                # [v11 H1] hybrid: center-crop(foveal, DFI 없음) 6토큰 + dense_4x4 전역 16토큰 = 22.
+                #   pair_match(dense) + identification/remedy(center-crop) 둘 다 노림.
+                self.sfe_crop_convs = _build_sfe_convs()           # 중앙 다중스케일 crop 6
+                self.dense_convs = nn.ModuleList([                 # 전역 4×4 윈도우 16
+                    nn.Conv2d(vit_hidden_size, sfe_dim,
+                              kernel_size=pre_ps_grid // 4, stride=pre_ps_grid // 4, bias=False)
+                ])
+                self.local_dense_proj = nn.Sequential(
+                    nn.GELU(), nn.Linear(sfe_dim, llm_hidden_size, bias=False)
+                )
+                logger.info(f'[v11] hybrid local: center-crop 6 + dense_4x4 16 = '
+                            f'{self._local_token_count()}토큰')
+            elif need_cropping:
+                # [v10 dense local windows] 32×32를 겹치지 않는(또는 겹치는) 윈도우 → 각 1토큰.
+                #   dense_4x4=16, dense_2x2=4, dense_8x8=64, dense_ms=16+4=20,
+                #   dense_4x4_satt=16(+로컬 spatial attn), dense_4x4_overlap=16(겹침)
+                if self._local_mode == "dense_4x4_overlap":
+                    # [E9] 겹치는 4×4: kernel 12 · stride 8 · pad 2 → 4×4=16, 윈도우가 겹침
+                    self.dense_convs = nn.ModuleList([
+                        nn.Conv2d(vit_hidden_size, sfe_dim, kernel_size=12, stride=8, padding=2, bias=False)
+                    ])
+                    _dbg = "overlap(k12s8p2)"
+                else:
+                    _Ps = {"dense_4x4": [4], "dense_4x4_satt": [4], "dense_2x2": [2],
+                           "dense_ms": [4, 2], "dense_8x8": [8], "dense_4x4_pos": [4]}[self._local_mode]
+                    self.dense_convs = nn.ModuleList([
+                        nn.Conv2d(vit_hidden_size, sfe_dim,
+                                  kernel_size=pre_ps_grid // P, stride=pre_ps_grid // P, bias=False)
+                        for P in _Ps
+                    ])
+                    _dbg = f"Ps={_Ps}"
+                self.local_dense_proj = nn.Sequential(
+                    nn.GELU(), nn.Linear(sfe_dim, llm_hidden_size, bias=False)
+                )
+                if self._local_mode == "dense_4x4_satt":
+                    self.local_satt = nn.Sequential(
+                        nn.Conv2d(vit_hidden_size, 1, kernel_size=1, bias=True), nn.Sigmoid()
+                    )
+                if self._local_mode == "dense_4x4_pos":
+                    # [H5] 16개 윈도우(4×4)에 대한 학습된 2D 위치 임베딩
+                    self.local_pos_emb = nn.Parameter(torch.zeros(1, 16, sfe_dim))
+                    nn.init.normal_(self.local_pos_emb, mean=0.0, std=0.02)
+                logger.info(f'[v10] dense local windows: mode={self._local_mode} '
+                            f'{_dbg} local_tokens={self._local_token_count()}')
 
             # ── v5: Attention modules ──
             self._use_spatial_attention = (self._use_spatial_attention_cfg and need_pooling)
-            self._use_channel_attention = (self._use_channel_attention_cfg and need_cropping)
+            # [E10] USE_CHANNEL_ATTN=0 → 로컬 branch channel attention 제거 ablation
+            self._use_channel_attention = (self._use_channel_attention_cfg and need_cropping
+                                           and _lb_os.environ.get("USE_CHANNEL_ATTN", "1") != "0")
             self._use_token_self_attention = (
                 self._use_token_self_attention_cfg
-                and self.spatial_feature_mode == "llava_sp_both"
+                and self.spatial_feature_mode == "koni_token_hier"
             )
 
             if self._use_spatial_attention:
@@ -397,7 +512,8 @@ class InternVLChatModel(PreTrainedModel):
                 logger.info(f'v5: Channel Attention enabled for cropping branch (reduction={r})')
 
             if self._use_token_self_attention:
-                self.sfe_crop_to_sfe = nn.Linear(sfe_dim * 2, sfe_dim, bias=False)
+                if self._local_mode == "center_crop":
+                    self.sfe_crop_to_sfe = nn.Linear(sfe_dim * 2, sfe_dim, bias=False)
                 self.sfe_token_ln = nn.LayerNorm(sfe_dim)
                 self.sfe_token_self_attn = nn.MultiheadAttention(
                     embed_dim=sfe_dim, num_heads=self._token_self_attention_heads,
@@ -419,10 +535,19 @@ class InternVLChatModel(PreTrainedModel):
 
             # Spatial token output normalization + learnable gate
             self.sfe_output_ln = nn.LayerNorm(llm_hidden_size)
+            # [실험 b] KTH_ZERO_INIT_OUTPUT=1 → KTH 출력을 0에서 시작(ReZero식).
+            #   초기 노이즈 제거 → 낮은 bias여도 게이트 안 죽고 KTH가 유용한 방향으로만 성장.
+            #   (fresh init에서만 적용; stage2 resume 시 학습된 값이 load로 덮어씀)
+            import os as _kth_os
+            if _kth_os.environ.get("KTH_ZERO_INIT_OUTPUT") == "1":
+                nn.init.zeros_(self.sfe_output_ln.weight)
+                nn.init.zeros_(self.sfe_output_ln.bias)
+                print("  [KTH_ZERO_INIT_OUTPUT] sfe_output_ln zero-init → KTH 출력 0에서 시작")
             # GATE_TYPE env var (scalar/per_token/content_aware)로 dispatch
-            _num_spatial_tokens = (len(sfe_scales) * 2
-                                   if self.spatial_feature_mode == "llava_sp_both"
-                                   else len(sfe_scales))
+            _num_spatial_tokens = (
+                len(sfe_scales) + self._local_token_count()
+                if self.spatial_feature_mode == "koni_token_hier"
+                else len(sfe_scales))
             self.sfe_spatial_gate = _make_spatial_gate(
                 num_tokens=_num_spatial_tokens, hidden_dim=llm_hidden_size,
                 default_type=getattr(config, "spatial_gate_type", "scalar"),
@@ -435,7 +560,7 @@ class InternVLChatModel(PreTrainedModel):
             # ── Cross-attention fusion: base tokens attend to KTH tokens ──
             self._use_cross_attention_fusion = (
                 self._use_cross_attention_fusion_cfg
-                and self.spatial_feature_mode in ("llava_sp_pooling", "llava_sp_cropping", "llava_sp_both")
+                and self.spatial_feature_mode in ("koni_pool", "koni_crop", "koni_token_hier")
             )
             if self._use_cross_attention_fusion:
                 self.sfe_xattn_ln_base = nn.LayerNorm(llm_hidden_size)
@@ -459,16 +584,17 @@ class InternVLChatModel(PreTrainedModel):
                 )
 
             # Backward compat aliases for single-mode access
-            if self.spatial_feature_mode == "llava_sp_pooling":
+            if self.spatial_feature_mode == "koni_pool":
                 self.sfe_convs = self.sfe_pool_convs
                 self.sfe_proj = self.sfe_pool_proj
-            elif self.spatial_feature_mode == "llava_sp_cropping":
+            elif self.spatial_feature_mode == "koni_crop":
                 self.sfe_convs = self.sfe_crop_convs
                 self.sfe_proj = self.sfe_crop_proj
 
             self._sfe_scales = sfe_scales
             n = len(sfe_scales)
-            self._sfe_num_tokens = n * 2 if self.spatial_feature_mode == "llava_sp_both" else n
+            self._sfe_num_tokens = (n + self._local_token_count()
+                                    if self.spatial_feature_mode == "koni_token_hier" else n)
 
             logger.info(
                 f'LLaVA-SP mode: {self.spatial_feature_mode}, '
@@ -542,15 +668,39 @@ class InternVLChatModel(PreTrainedModel):
             return (int(value[0]), int(value[1]))
         raise ValueError(f"{name} must be an int or a tuple/list of length 2.")
 
+    def _local_token_count(self) -> int:
+        """[v10] local(cropping) branch 토큰 수. env LOCAL_BRANCH로 분기.
+        forward 출력 개수와 반드시 일치해야 num_image_token(=256+extra)이 맞음.
+        center_crop=기존(len(sfe_scales)), dense_4x4=16, dense_2x2=4, dense_ms=20."""
+        import os as _lb_os
+        mode = _lb_os.environ.get("LOCAL_BRANCH", "center_crop")
+        # none=E7(local 없음), center_crop=동심원, global_ca=E6(전역 pooling)
+        if mode == "none":
+            return 0
+        if mode in ("center_crop", "global_ca"):
+            return len(self.sfe_scales or [4, 8, 14, 20, 26, 32])
+        if mode == "hybrid":
+            # [H1] center-crop(foveal) + dense_4x4(전역) concat
+            return len(self.sfe_scales or [4, 8, 14, 20, 26, 32]) + 16
+        counts = {"dense_4x4": 16, "dense_4x4_satt": 16, "dense_4x4_overlap": 16,
+                  "dense_2x2": 4, "dense_ms": 20, "dense_8x8": 64, "dense_4x4_pos": 16}
+        if mode not in counts:
+            raise ValueError(f"Unknown LOCAL_BRANCH={mode!r}")
+        return counts[mode]
+
     def _infer_extra_tokens(self, grid_size: int) -> int:
         if self.spatial_feature_mode == "none":
             return 0
         if self.spatial_feature_mode == "register_only":
             return getattr(self.config, "register_num_tokens", 12)
-        if self.spatial_feature_mode in ("llava_sp_pooling", "llava_sp_cropping", "llava_sp_both"):
+        if self.spatial_feature_mode in ("koni_pool", "koni_crop", "koni_token_hier"):
             sfe_scales = self.sfe_scales or [4, 8, 14, 20, 26, grid_size * 2]
             n = len(sfe_scales)
-            return n * 2 if self.spatial_feature_mode == "llava_sp_both" else n
+            if self.spatial_feature_mode == "koni_token_hier":
+                return n + self._local_token_count()
+            if self.spatial_feature_mode == "koni_crop":
+                return self._local_token_count()
+            return n
         if self.spatial_feature_mode == "pool":
             pool_size = self.spatial_pool_size or (2, 2)
             return int(pool_size[0] * pool_size[1])
@@ -669,7 +819,49 @@ class InternVLChatModel(PreTrainedModel):
             return fused
         return self.sfe_crop_proj(fused)  # (B, N, llm_hidden)
 
-    def _extract_llava_sp_tokens(self, vit_grid: torch.Tensor) -> torch.Tensor:
+    def _local_forward(self, features: torch.Tensor) -> torch.Tensor:
+        """[v10] dense local windows → (B, M, sfe_dim). center-crop 대체(중앙편향 제거).
+        32×32 그리드를 P×P 겹치지 않는 윈도우로 나눠 각 윈도우를 1토큰(strided conv).
+        channel attention은 center_crop과 동일하게 유지. dense_4x4_satt는 로컬 spatial attn 가중."""
+        if self._use_channel_attention:
+            gap = self.sfe_channel_pool(features).flatten(1)      # (B, C)
+            wv = self.sfe_channel_fc(gap)                         # (B, C)
+            features = features * wv.unsqueeze(-1).unsqueeze(-1)
+        if self._local_mode == "global_ca":
+            # [E6] 전역 멀티스케일 pooling(AdaptiveAvgPool(k)+Conv) → 6토큰. spatial attn 없음.
+            toks = [conv(features).squeeze(-1).squeeze(-1) for conv in self.local_pool_convs]
+            return torch.stack(toks, dim=1).nan_to_num()          # (B, 6, sfe_dim)
+        if self._local_mode == "hybrid":
+            # [H1] center-crop 6(foveal, 중앙 다중스케일) + dense_4x4 16(전역) concat = 22
+            B, C, H, W = features.shape
+            ch, cw = H // 2, W // 2
+            crop_toks = []
+            for conv, k in zip(self.sfe_crop_convs, self._sfe_scales):
+                if k >= H:
+                    crop = features
+                else:
+                    half = k // 2
+                    hs = min(max(0, ch - half), H - k); ws = min(max(0, cw - half), W - k)
+                    crop = features[:, :, hs:hs + k, ws:ws + k]
+                crop_toks.append(conv(crop).squeeze(-1).squeeze(-1))
+            crop_tokens = torch.stack(crop_toks, dim=1)           # (B, 6, sfe_dim)
+            dense_toks = [c(features).flatten(2).transpose(1, 2) for c in self.dense_convs]
+            dense_tokens = torch.cat(dense_toks, dim=1)           # (B, 16, sfe_dim)
+            return torch.cat([crop_tokens, dense_tokens], dim=1).nan_to_num()  # (B, 22, sfe_dim)
+        if self._local_mode == "dense_4x4_satt":
+            features = features * self.local_satt(features)       # (B,1,H,W) saliency 가중
+        toks = []
+        for conv in self.dense_convs:
+            t = conv(features)                                    # (B, sfe_dim, P, P)
+            t = t.flatten(2).transpose(1, 2)                      # (B, P*P, sfe_dim)
+            toks.append(t)
+        out = torch.cat(toks, dim=1)                              # (B, M, sfe_dim)
+        if self._local_mode == "dense_4x4_pos":
+            # [H5] 각 윈도우 토큰에 학습된 2D 위치 임베딩 더함 → LLM이 "어느 구역" 토큰인지 grounding
+            out = out + self.local_pos_emb.to(out.dtype)          # (1, 16, sfe_dim) broadcast
+        return out.nan_to_num()                                   # (B, M, sfe_dim)
+
+    def _extract_koni_tokens(self, vit_grid: torch.Tensor) -> torch.Tensor:
         """LLaVA-SP spatial token extraction on pre-pixel-shuffle ViT grid.
 
         Args:
@@ -680,19 +872,25 @@ class InternVLChatModel(PreTrainedModel):
         """
         features = vit_grid.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
 
-        if self.spatial_feature_mode == "llava_sp_pooling":
+        if self.spatial_feature_mode == "koni_pool":
             return self._sfe_pooling_forward(features)
 
-        elif self.spatial_feature_mode == "llava_sp_cropping":
+        elif self.spatial_feature_mode == "koni_crop":
             return self._sfe_cropping_dfi_forward(features)
 
-        elif self.spatial_feature_mode == "llava_sp_both":
+        elif self.spatial_feature_mode == "koni_token_hier":
             if self._use_token_self_attention:
                 # Get raw tokens at sfe_dim level for interaction
                 pool_raw = self._sfe_pooling_forward(features, return_raw=True)     # (B, 6, sfe_dim)
-                crop_raw = self._sfe_cropping_dfi_forward(features, return_raw=True)  # (B, 6, sfe_dim*2)
-                crop_reduced = self.sfe_crop_to_sfe(crop_raw)  # (B, 6, sfe_dim)
-                combined = torch.cat([pool_raw, crop_reduced], dim=1)  # (B, 12, sfe_dim)
+                if self._local_mode == "none":
+                    combined = pool_raw                              # [E7] pool-only, local 없음
+                elif self._local_mode == "center_crop":
+                    crop_raw = self._sfe_cropping_dfi_forward(features, return_raw=True)  # (B, 6, sfe_dim*2)
+                    local_reduced = self.sfe_crop_to_sfe(crop_raw)  # (B, 6, sfe_dim)
+                    combined = torch.cat([pool_raw, local_reduced], dim=1)
+                else:
+                    local_reduced = self._local_forward(features)   # (B, M, sfe_dim)
+                    combined = torch.cat([pool_raw, local_reduced], dim=1)  # (B, 6+M, sfe_dim)
                 # Self-attention with residual
                 residual = combined
                 combined = self.sfe_token_ln(combined)
@@ -700,12 +898,17 @@ class InternVLChatModel(PreTrainedModel):
                 combined = residual + combined
                 # FFN with residual
                 combined = combined + self.sfe_token_ffn(combined)
-                result = self.sfe_token_proj(combined)  # (B, 12, llm_hidden)
+                result = self.sfe_token_proj(combined)  # (B, 6+M, llm_hidden)
                 return result
             else:
                 pool_tokens = self._sfe_pooling_forward(features)      # (B, 6, llm_hidden)
-                crop_tokens = self._sfe_cropping_dfi_forward(features)  # (B, 6, llm_hidden)
-                return torch.cat([pool_tokens, crop_tokens], dim=1)     # (B, 12, llm_hidden)
+                if self._local_mode == "none":
+                    return pool_tokens                                 # [E7] pool-only
+                elif self._local_mode == "center_crop":
+                    crop_tokens = self._sfe_cropping_dfi_forward(features)  # (B, 6, llm_hidden)
+                else:
+                    crop_tokens = self.local_dense_proj(self._local_forward(features))  # (B, M, llm_hidden)
+                return torch.cat([pool_tokens, crop_tokens], dim=1)     # (B, 6+M, llm_hidden)
 
         raise ValueError(f"Unsupported LLaVA-SP mode: {self.spatial_feature_mode}")
 
@@ -862,9 +1065,9 @@ class InternVLChatModel(PreTrainedModel):
             return self.register_tokens(base_tokens)  # (B, 268, llm_hidden)
 
         # ── LLaVA-SP: SFE on pre-pixel-shuffle grid, separate projection ──
-        if self.spatial_feature_mode in ("llava_sp_pooling", "llava_sp_cropping", "llava_sp_both"):
+        if self.spatial_feature_mode in ("koni_pool", "koni_crop", "koni_token_hier"):
             # Branch 1: SFE spatial tokens (on 32x32 raw ViT grid)
-            spatial_tokens = self._extract_llava_sp_tokens(vit_embeds)  # (B, 12, llm_hidden)
+            spatial_tokens = self._extract_koni_tokens(vit_embeds)  # (B, 12, llm_hidden)
 
             # Normalize spatial tokens + learnable gate (scale mismatch 방지)
             spatial_tokens = self.sfe_output_ln(spatial_tokens)

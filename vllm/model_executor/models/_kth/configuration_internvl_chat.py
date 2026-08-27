@@ -45,7 +45,7 @@ class InternVLChatConfig(PretrainedConfig):
         sfe_scales=None,
         dfi_detail_kernel=16,
         dfi_detail_stride=4,
-        # v5: attention modules (only effective with llava_sp_* modes)
+        # v5: attention modules (only effective with koni_* modes)
         use_spatial_attention=False,
         use_channel_attention=False,
         use_token_self_attention=False,
