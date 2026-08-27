@@ -432,7 +432,12 @@ _MULTIMODAL_MODELS = {
         "hunyuan_vision",
         "HunYuanVLForConditionalGeneration",
     ),
-    "InternVLChatModel": ("internvl", "InternVLChatModel"),
+    # Encoder-modified (KTH/spatial-feature) checkpoints ship architectures=
+    # ["InternVLChatModel"] but need the spatial vision tower. KTHInternvlChatModel
+    # falls back to stock behaviour when the config declares no spatial mode, so
+    # routing every InternVL checkpoint here is safe and makes KTH servable without
+    # editing each checkpoint's config.json.
+    "InternVLChatModel": ("kth_internvl", "KTHInternvlChatModel"),
     "KTHInternvlChatModel": ("kth_internvl", "KTHInternvlChatModel"),
     "InternS1ForConditionalGeneration": (
         "interns1",
