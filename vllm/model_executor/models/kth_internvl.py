@@ -27,8 +27,7 @@ from .internvl import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from ._kth.kth_vision import has_kth, build_kth_vision
-from ._kth import _orig_modeling as _orig
+from ._kth.kth_vision import has_kth, build_kth_vision, infer_extra_tokens
 
 # old checkpoints (KTH_720k, FullFT_*) name the modes llava_sp_*; v10 renamed them koni_*
 _SFM_ALIAS = {
@@ -38,40 +37,12 @@ _SFM_ALIAS = {
 }
 
 
-def _kth_extra_tokens(config) -> int:
-    """Extra spatial tokens added on top of the base image tokens per tile.
+def _kth_extra_tokens(config, model_path: str | None = None) -> int:
+    """Extra spatial tokens per tile — computed by the checkpoint's own code.
 
-    Do NOT reimplement this. The count depends on ``spatial_feature_mode``, on
-    ``sfe_scales`` and — for the cropping branch — on the ``LOCAL_BRANCH`` env var
-    (center_crop/global_ca = len(scales), dense_4x4 = 16, dense_8x8 = 64, hybrid =
-    len(scales)+16, none = 0). Delegate to the checkpoint's own ``_infer_extra_tokens``
-    so this can never drift from the vendored modeling code.
+    Never reimplement this. See ``_kth/kth_vision.infer_extra_tokens``.
     """
-    return _infer_extra_tokens_via_model(config)
-
-
-class _ExtraTokenShim:
-    """Minimal stand-in exposing exactly what ``_infer_extra_tokens`` reads."""
-
-    def __init__(self, config):
-        self.config = config
-        raw = getattr(config, "spatial_feature_mode", "none")
-        # old checkpoints use the llava_sp_* names; the model normalizes them to koni_*
-        self.spatial_feature_mode = _SFM_ALIAS.get(raw, raw)
-        self.sfe_scales = getattr(config, "sfe_scales", None)
-        self.spatial_pool_size = getattr(config, "spatial_pool_size", None)
-        self.spatial_crop_size = getattr(config, "spatial_crop_size", None)
-        self.spatial_crop_stride = getattr(config, "spatial_crop_stride", None)
-
-    _local_token_count = _orig.InternVLChatModel._local_token_count
-    _infer_extra_tokens = _orig.InternVLChatModel._infer_extra_tokens
-
-
-def _infer_extra_tokens_via_model(config) -> int:
-    vc = config.vision_config
-    downsample_ratio = float(getattr(config, "downsample_ratio", 0.5))
-    grid = int((vc.image_size // vc.patch_size) * downsample_ratio)
-    return int(_ExtraTokenShim(config)._infer_extra_tokens(grid))
+    return infer_extra_tokens(config, model_path)
 
 
 class KTHInternvlProcessingInfo(InternVLProcessingInfo):
@@ -79,7 +50,8 @@ class KTHInternvlProcessingInfo(InternVLProcessingInfo):
         proc = super().get_hf_processor(**kwargs)
         config = self.get_hf_config()
         if has_kth(config):
-            proc.image_seq_length = int(proc.image_seq_length) + _kth_extra_tokens(config)
+            proc.image_seq_length = (int(proc.image_seq_length)
+                                     + _kth_extra_tokens(config, self.model_id))
         return proc
 
 
@@ -97,7 +69,8 @@ class KTHInternvlChatModel(_VLLMInternVL):
         self._is_kth = has_kth(config)
         if self._is_kth:
             # original vision tower on meta device; weights filled in load_weights
-            self._kth = build_kth_vision(config)
+            model_path = getattr(vllm_config.model_config, "model", None)
+            self._kth = build_kth_vision(config, model_path)
             self.num_image_token = int(self._kth.num_image_token)
             # stock vision/mlp1 unused (weights go to _kth) -> avoid conflicts
             self.vision_model = None

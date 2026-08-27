@@ -1,19 +1,23 @@
-"""Regression: KTH extra-token count must come from the vendored modeling code.
+"""Regression: KTH vision code must come from the checkpoint, never a vendored copy.
 
-The bug this pins: ``_kth_extra_tokens`` used to hardcode the count from the
-``llava_sp_*`` mode names. Checkpoints later renamed those modes to ``koni_*`` and
-made the cropping-branch count depend on the ``LOCAL_BRANCH`` env var. The hardcoded
-version then returned 0 for every real checkpoint — the model loaded, ran, and
-answered with the entire spatial-feature contribution missing and no error raised.
+The bug this pins. The extra-token count was hardcoded from the ``llava_sp_*`` mode
+names and the modeling code was vendored under ``_kth/``. Checkpoints later renamed
+those modes to ``koni_*``, replaced the content-aware gate, and made the cropping
+branch selectable through the ``LOCAL_BRANCH`` env var. The vendored copy went stale,
+so on a current checkpoint the count came out 0, the spatial modules were never built,
+and their weights were dropped — while the token bookkeeping stayed self-consistent.
+The model loaded, ran, and answered with the whole KTH contribution missing, and
+nothing raised.
 
-Any future edit that reimplements the count instead of delegating will fail here.
+The fix is structural: load the class out of the checkpoint at runtime. These tests
+fail if anyone reintroduces a reimplementation or a vendored import.
 """
 import os
 
 import pytest
 
+from vllm.model_executor.models._kth import kth_vision
 from vllm.model_executor.models.kth_internvl import _kth_extra_tokens
-from vllm.model_executor.models._kth import _orig_modeling as _orig
 
 
 class _Cfg:
@@ -58,24 +62,50 @@ def test_plain_internvl_gets_no_extra_tokens():
     assert _kth_extra_tokens(_Cfg("none")) == 0
 
 
-def test_delegates_to_vendored_modeling(monkeypatch):
-    """The count must equal what the checkpoint's own module would compute."""
-    monkeypatch.setenv("LOCAL_BRANCH", "global_ca")
-    cfg = _Cfg("koni_token_hier")
-
-    class _Shim:
-        config = cfg
-        spatial_feature_mode = "koni_token_hier"
-        sfe_scales = cfg.sfe_scales
-        spatial_pool_size = spatial_crop_size = spatial_crop_stride = None
-        _local_token_count = _orig.InternVLChatModel._local_token_count
-        _infer_extra_tokens = _orig.InternVLChatModel._infer_extra_tokens
-
-    assert _kth_extra_tokens(cfg) == _Shim()._infer_extra_tokens(16)
-
-
 def test_unknown_local_branch_is_rejected(monkeypatch):
     """Silently guessing a token count would desync the image placeholders."""
     monkeypatch.setenv("LOCAL_BRANCH", "not_a_real_branch")
     with pytest.raises(ValueError, match="LOCAL_BRANCH"):
         _kth_extra_tokens(_Cfg("koni_token_hier"))
+
+
+def test_class_is_loaded_from_the_checkpoint(tmp_path, monkeypatch):
+    """A checkpoint that ships modeling code must win over the vendored fallback."""
+    shipped = tmp_path / "modeling_internvl_chat.py"
+    shipped.write_text(
+        "class InternVLChatModel:\n"
+        "    _loaded_from_checkpoint = True\n"
+        "    def tie_weights(self):\n"
+        "        pass\n"
+    )
+    seen = {}
+
+    def _fake(qualname, path, **kwargs):
+        seen["path"] = path
+        ns: dict = {}
+        exec(shipped.read_text(), ns)
+        return ns["InternVLChatModel"]
+
+    monkeypatch.setattr(
+        "transformers.dynamic_module_utils.get_class_from_dynamic_module", _fake)
+    cls = kth_vision.load_kth_class(str(tmp_path))
+    assert getattr(cls, "_loaded_from_checkpoint", False)
+    assert seen["path"] == str(tmp_path)
+
+
+def test_falls_back_only_when_checkpoint_ships_no_code(tmp_path):
+    """No remote code in the checkpoint -> vendored copy, and it must still work."""
+    cls = kth_vision.load_kth_class(str(tmp_path))
+    assert cls.__name__ == "InternVLChatModel"
+    assert not getattr(cls, "_loaded_from_checkpoint", False)
+
+
+def test_internvl_arch_routes_to_kth():
+    """KTH checkpoints declare architectures=["InternVLChatModel"].
+
+    Serving them must not require editing config.json, so that name has to resolve
+    to the KTH class (which falls back to stock behaviour for plain InternVL).
+    """
+    from vllm.model_executor.models.registry import _MULTIMODAL_MODELS
+    assert _MULTIMODAL_MODELS["InternVLChatModel"] == (
+        "kth_internvl", "KTHInternvlChatModel")
