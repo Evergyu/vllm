@@ -21,6 +21,10 @@ import os
 import torch
 import torch.nn as nn
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 from .configuration_internvl_chat import InternVLChatConfig
 
 
@@ -55,20 +59,37 @@ def _apply_tf_compat(cls) -> None:
     cls._kth_tie_patched = True
 
 
-def load_kth_class(model_path: str | None):
+def load_kth_class(model_path: str | None, config=None):
     """Return the checkpoint's own ``InternVLChatModel`` class.
 
-    Falls back to the vendored copy only when the checkpoint ships no remote code,
-    which is not the case for any current KTH checkpoint.
+    Works for a local directory and for a Hugging Face Hub repo id alike: the
+    ``auto_map`` entry in ``config.json`` is the signal, and
+    ``get_class_from_dynamic_module`` resolves either form (downloading the module
+    from the Hub when needed).
+
+    Falls back to the vendored copy only when the checkpoint ships no remote code.
+    That path is a hazard — it is how the model silently loses its spatial modules —
+    so it warns.
     """
-    if model_path and os.path.isfile(
+    ref = None
+    if config is not None:
+        auto_map = getattr(config, "auto_map", None) or {}
+        ref = auto_map.get("AutoModel") or auto_map.get("AutoModelForCausalLM")
+    if ref is None and model_path and os.path.isfile(
             os.path.join(model_path, "modeling_internvl_chat.py")):
+        ref = "modeling_internvl_chat.InternVLChatModel"
+
+    if ref and model_path:
         from transformers.dynamic_module_utils import get_class_from_dynamic_module
-        cls = get_class_from_dynamic_module(
-            "modeling_internvl_chat.InternVLChatModel", model_path)
+        cls = get_class_from_dynamic_module(ref, model_path)
         _apply_tf_compat(cls)
         return cls
 
+    logger.warning(
+        "KTH: no remote modeling code found for %r — falling back to the vendored "
+        "copy under _kth/. That copy can be older than the checkpoint, in which case "
+        "the spatial modules are not built and their weights are dropped without an "
+        "error. Ship modeling_internvl_chat.py with the checkpoint.", model_path)
     from . import _orig_modeling as _fallback
     _apply_tf_compat(_fallback.InternVLChatModel)
     return _fallback.InternVLChatModel
@@ -81,7 +102,7 @@ def build_kth_vision(config: InternVLChatConfig, model_path: str | None = None) 
     ``extract_feature(pixel_values)`` yields ``(num_patches, num_image_token, hidden)``
     including the extra spatial tokens.
     """
-    cls = load_kth_class(model_path)
+    cls = load_kth_class(model_path, config)
     stub = _StubLLM(config.llm_config)
     with torch.device("meta"):
         m = cls(config, language_model=stub, use_flash_attn=False)
@@ -97,7 +118,7 @@ def infer_extra_tokens(config, model_path: str | None = None) -> int:
     (center_crop/global_ca = len(scales), dense_4x4 = 16, dense_8x8 = 64,
     hybrid = len(scales)+16, none = 0).
     """
-    cls = load_kth_class(model_path)
+    cls = load_kth_class(model_path, config)
     raw = getattr(config, "spatial_feature_mode", "none")
     alias = {"llava_sp_both": "koni_token_hier",
              "llava_sp_pooling": "koni_pool",
