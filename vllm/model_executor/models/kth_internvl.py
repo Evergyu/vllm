@@ -13,6 +13,7 @@ when the config declares a spatial-feature mode:
 
 For plain InternVL configs the same class falls back to stock vLLM behavior.
 """
+import os
 from collections.abc import Iterable
 
 import torch
@@ -27,20 +28,50 @@ from .internvl import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from ._kth.kth_vision import has_kth, build_kth_vision
+from ._kth import _orig_modeling as _orig
+
+# old checkpoints (KTH_720k, FullFT_*) name the modes llava_sp_*; v10 renamed them koni_*
+_SFM_ALIAS = {
+    "llava_sp_both": "koni_token_hier",
+    "llava_sp_pooling": "koni_pool",
+    "llava_sp_cropping": "koni_crop",
+}
 
 
 def _kth_extra_tokens(config) -> int:
-    """Extra spatial tokens added on top of the base image tokens per tile."""
-    mode = getattr(config, "spatial_feature_mode", "none")
-    scales = getattr(config, "sfe_scales", None) or [4, 8, 14, 20, 26, 32]
-    n = len(scales)
-    if mode == "llava_sp_both":
-        return n * 2
-    if mode in ("llava_sp_pooling", "llava_sp_cropping"):
-        return n
-    if mode == "register_only":
-        return 12
-    return 0
+    """Extra spatial tokens added on top of the base image tokens per tile.
+
+    Do NOT reimplement this. The count depends on ``spatial_feature_mode``, on
+    ``sfe_scales`` and — for the cropping branch — on the ``LOCAL_BRANCH`` env var
+    (center_crop/global_ca = len(scales), dense_4x4 = 16, dense_8x8 = 64, hybrid =
+    len(scales)+16, none = 0). Delegate to the checkpoint's own ``_infer_extra_tokens``
+    so this can never drift from the vendored modeling code.
+    """
+    return _infer_extra_tokens_via_model(config)
+
+
+class _ExtraTokenShim:
+    """Minimal stand-in exposing exactly what ``_infer_extra_tokens`` reads."""
+
+    def __init__(self, config):
+        self.config = config
+        raw = getattr(config, "spatial_feature_mode", "none")
+        # old checkpoints use the llava_sp_* names; the model normalizes them to koni_*
+        self.spatial_feature_mode = _SFM_ALIAS.get(raw, raw)
+        self.sfe_scales = getattr(config, "sfe_scales", None)
+        self.spatial_pool_size = getattr(config, "spatial_pool_size", None)
+        self.spatial_crop_size = getattr(config, "spatial_crop_size", None)
+        self.spatial_crop_stride = getattr(config, "spatial_crop_stride", None)
+
+    _local_token_count = _orig.InternVLChatModel._local_token_count
+    _infer_extra_tokens = _orig.InternVLChatModel._infer_extra_tokens
+
+
+def _infer_extra_tokens_via_model(config) -> int:
+    vc = config.vision_config
+    downsample_ratio = float(getattr(config, "downsample_ratio", 0.5))
+    grid = int((vc.image_size // vc.patch_size) * downsample_ratio)
+    return int(_ExtraTokenShim(config)._infer_extra_tokens(grid))
 
 
 class KTHInternvlProcessingInfo(InternVLProcessingInfo):
@@ -98,11 +129,18 @@ class KTHInternvlChatModel(_VLLMInternVL):
         return loaded
 
     def _load_kth_state(self, kth_state: dict) -> set[str]:
-        """Materialize the meta params/buffers of the vision module from checkpoint."""
+        """Materialize the meta params/buffers of the vision module from checkpoint.
+
+        This must be strict. The vision tower here is the checkpoint's *own* module,
+        so a name that does not match means the vendored modeling code has drifted
+        from the checkpoint — and silently zero-filling it would produce a model that
+        loads without error and answers with the spatial features missing.
+        """
         dev = next(self.language_model.parameters()).device
         own = dict(self._kth.named_parameters())
         own_buf = dict(self._kth.named_buffers())
         loaded = set()
+        unexpected = []
         for name, w in kth_state.items():
             tgt = own.get(name)
             is_buf = False
@@ -110,16 +148,34 @@ class KTHInternvlChatModel(_VLLMInternVL):
                 tgt = own_buf.get(name)
                 is_buf = True
             if tgt is None:
-                continue  # unknown key (e.g. stub leftover) -> skip
+                unexpected.append(name)
+                continue
+            if tuple(tgt.shape) != tuple(w.shape):
+                raise ValueError(
+                    f"KTH vision weight shape mismatch for {name!r}: "
+                    f"module expects {tuple(tgt.shape)}, checkpoint has {tuple(w.shape)}. "
+                    "The vendored modeling code does not match this checkpoint."
+                )
             data = w.to(device=dev, dtype=tgt.dtype if tgt.dtype.is_floating_point else w.dtype)
             _set_submodule_tensor(self._kth, name, data, is_buffer=is_buf)
             loaded.add(name)
-        # remaining meta params (e.g. learned register inits without weights) -> zero init
-        _materialize_remaining_meta(self._kth, dev)
-        # report every vision-module param/buffer under the model path (_kth.*) as loaded
-        full = {f"_kth.{n}" for n, _ in self._kth.named_parameters()}
-        full |= {f"_kth.{n}" for n, _ in self._kth.named_buffers()}
-        return full
+
+        # anything still on meta got no checkpoint weight -> that is a load failure,
+        # not something to zero-fill. Buffers may legitimately be recomputed.
+        missing = [n for n, p in self._kth.named_parameters() if p.device.type == "meta"]
+        if missing or unexpected:
+            raise ValueError(
+                "KTH vision weight loading is incomplete — refusing to run with an "
+                "unverified vision tower.\n"
+                f"  spatial_feature_mode = {getattr(self.config, 'spatial_feature_mode', None)!r}\n"
+                f"  LOCAL_BRANCH         = {os.environ.get('LOCAL_BRANCH', 'center_crop')!r}\n"
+                f"  {len(missing)} param(s) with no checkpoint weight: {missing[:8]}\n"
+                f"  {len(unexpected)} checkpoint key(s) with no module param: {unexpected[:8]}\n"
+                "Re-vendor vllm/model_executor/models/_kth/ from this checkpoint's "
+                "remote code (modeling_internvl_chat.py -> _orig_modeling.py)."
+            )
+        _materialize_remaining_meta(self._kth, dev)  # buffers only, by now
+        return {f"_kth.{n}" for n in loaded}
 
 
 def _set_submodule_tensor(root, dotted: str, data: torch.Tensor, is_buffer=False):
