@@ -28,6 +28,7 @@ from .internvl import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from ._kth.kth_vision import has_kth, build_kth_vision, infer_extra_tokens
+from ._kth.koni_tiling import KoniInternVLImageProcessor, koni_target_ratios
 
 # old checkpoints (KTH_720k, FullFT_*) name the modes llava_sp_*; v10 renamed them koni_*
 _SFM_ALIAS = {
@@ -46,12 +47,44 @@ def _kth_extra_tokens(config, model_path: str | None = None) -> int:
 
 
 class KTHInternvlProcessingInfo(InternVLProcessingInfo):
+    def get_image_processor(self, **kwargs):
+        """Use the reference harness's tie-break order when tiling.
+
+        See ``_kth/koni_tiling`` — upstream picks a different tied ratio, which
+        changes the tile count on ~10% of real benchmark images. Serving has to
+        reproduce the published numbers.
+        """
+        proc = super().get_image_processor(**kwargs)
+        if not has_kth(self.get_hf_config()):
+            return proc
+        return KoniInternVLImageProcessor(
+            image_size=proc.image_size,
+            min_dynamic_patch=proc.min_dynamic_patch,
+            max_dynamic_patch=proc.max_dynamic_patch,
+            dynamic_image_size=proc.dynamic_image_size,
+            use_thumbnail=proc.use_thumbnail,
+        )
+
     def get_hf_processor(self, **kwargs) -> InternVLProcessor:
         proc = super().get_hf_processor(**kwargs)
         config = self.get_hf_config()
-        if has_kth(config):
-            proc.image_seq_length = (int(proc.image_seq_length)
-                                     + _kth_extra_tokens(config, self.model_id))
+        if not has_kth(config):
+            return proc
+
+        proc.image_seq_length = (int(proc.image_seq_length)
+                                 + _kth_extra_tokens(config, self.model_id))
+
+        # The placeholder count must be derived from the same candidate order the
+        # pixels are tiled with, or the image tokens desync from the tiles.
+        _orig_resolve = proc.resolve_target_ratios
+
+        def _resolve(*args, **kw):
+            ratios = _orig_resolve(*args, **kw)
+            mn = min(a * b for a, b in ratios)
+            mx = max(a * b for a, b in ratios)
+            return koni_target_ratios(mn, mx)
+
+        proc.resolve_target_ratios = _resolve
         return proc
 
 

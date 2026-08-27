@@ -10,8 +10,18 @@ attention, prefix caching, OpenAI-compatible API.
 ## Serve
 
 ```bash
-vllm serve /path/to/checkpoint --trust-remote-code
+export LOCAL_BRANCH=global_ca          # must match training
+vllm serve /path/to/checkpoint \
+    --trust-remote-code \
+    --chat-template examples/template/koni_v.jinja
 ```
+
+`--chat-template` matters. The checkpoint's own `chat_template.jinja` injects **no**
+system message, but `model.chat()` — the reference path — always supplies the KONI-V
+identity prompt from `conversation.py`, and the model was SFT'd with it. Without this
+flag a request that carries no system message is served in a state the model never saw
+in training. The shipped template injects it and steps aside when the caller sends
+their own.
 
 `--trust-remote-code` is required: the vision tower class is loaded from the
 checkpoint's own `modeling_internvl_chat.py` at runtime.
@@ -64,10 +74,20 @@ decoder (HF vision + prompt assembly, vLLM decode) reproduces it:
 Item-level disagreement is symmetric (HF-only-correct 5 vs vLLM-only-correct 7 on
 ChartQA), i.e. numerical jitter on borderline items, not a systematic loss.
 
-**This model path additionally reimplements tiling** (vLLM's `InternVLProcessor` rather
-than the checkpoint's `dynamic_preprocess`). That axis is not covered by the numbers
-above. Verify tile count and pixel values against the HF reference before trusting a
-new deployment.
+### Tiling
+
+Tiling now reproduces the reference harness bit for bit — verified pixel-identical on
+12 aspect ratios including the cases where upstream disagrees.
+
+InternVL's `find_closest_aspect_ratio` returns the **last** tied candidate that passes
+its area test, so the tile count depends on the iteration order of the candidate
+container. Upstream vLLM sorts by block count; the harness passes a `set`. On a
+300-image sample they differ on 14.0% of ChartQA and 9.3% of DocVQA images, in both
+directions — a 1000x1000 image is 1 tile under the harness and 9 upstream.
+
+Every published KONI-V number was measured with the harness order, so
+`_kth/koni_tiling.py` reproduces that order (by building the container the same way,
+not by freezing a hash order). If the reference pipeline ever changes, this follows.
 
 ## Note on `async_scheduling`
 
