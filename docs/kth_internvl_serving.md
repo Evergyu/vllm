@@ -93,6 +93,26 @@ Every published KTH number was measured with the harness order, so
 `_kth/kth_tiling.py` reproduces that order (by building the container the same way,
 not by freezing a hash order). If the reference pipeline ever changes, this follows.
 
+## Parallelism
+
+**Tensor parallel works.** The vision tower is the checkpoint's own module and is not
+sharded, so it is replicated on every rank — the same thing stock InternVL does. Each
+rank computes identical image embeddings and only the decoder is split. The cost is
+memory: the tower is resident once per rank.
+
+```bash
+vllm serve <ckpt> --trust-remote-code --tensor-parallel-size 2
+```
+
+**Pipeline parallel is structurally supported but unverified.** `SupportsPP` and
+`make_empty_intermediate_tensors` come from the language model, and the tower is built
+on every stage (again, as upstream does). Weight loading no longer assumes the language
+model owns parameters on this rank, which a non-first stage may not.
+
+Neither has been measured on this model. If you deploy with either, check
+`num_image_token: 268` in the log and spot-check output against the accuracy reference
+below before trusting it.
+
 ## Note on `async_scheduling`
 
 vLLM's `enable_prompt_embeds` + `async_scheduling` combination had a decode bug where
