@@ -107,7 +107,7 @@ def test_internvl_arch_routes_to_kth():
     to the KTH class (which falls back to stock behaviour for plain InternVL).
     """
     from vllm.model_executor.models.registry import _MULTIMODAL_MODELS
-    for arch in ("InternVLChatModel", "KoniVChatModel"):
+    for arch in ("InternVLChatModel", "KTHChatModel"):
         assert _MULTIMODAL_MODELS[arch] == ("kth_internvl", "KTHInternvlChatModel"), arch
 
 
@@ -124,7 +124,7 @@ def _harness_ratios(min_num: int, max_num: int):
 
 
 def test_tiling_matches_the_reference_harness():
-    """Tie-breaks must resolve the way every published KONI-V number was measured.
+    """Tie-breaks must resolve the way every published KTH number was measured.
 
     ``find_closest_aspect_ratio`` picks the last tied candidate that passes the area
     test, so the iteration order decides the tile count. Upstream sorts by block
@@ -133,7 +133,7 @@ def test_tiling_matches_the_reference_harness():
     """
     from PIL import Image
 
-    from vllm.model_executor.models._kth.koni_tiling import koni_target_ratios
+    from vllm.model_executor.models._kth.kth_tiling import kth_target_ratios
     from vllm.transformers_utils.processors.internvl import (
         dynamic_preprocess_internvl,
         get_internvl_target_ratios,
@@ -145,7 +145,7 @@ def test_tiling_matches_the_reference_harness():
     for w, h in sizes:
         img = Image.new("RGB", (w, h))
         koni = dynamic_preprocess_internvl(
-            img, target_ratios=koni_target_ratios(1, 12),
+            img, target_ratios=kth_target_ratios(1, 12),
             image_size=448, use_thumbnail=True)
         harness = dynamic_preprocess_internvl(
             img, target_ratios=_harness_ratios(1, 12),
@@ -167,33 +167,24 @@ def test_square_image_tiles_like_the_harness():
     """The clearest single case: a large square image is one tile, not nine."""
     from PIL import Image
 
-    from vllm.model_executor.models._kth.koni_tiling import koni_target_ratios
+    from vllm.model_executor.models._kth.kth_tiling import kth_target_ratios
     from vllm.transformers_utils.processors.internvl import dynamic_preprocess_internvl
 
     tiles = dynamic_preprocess_internvl(
-        Image.new("RGB", (1000, 1000)), target_ratios=koni_target_ratios(1, 12),
+        Image.new("RGB", (1000, 1000)), target_ratios=kth_target_ratios(1, 12),
         image_size=448, use_thumbnail=True)
     assert len(tiles) == 1
 
 
-def test_chat_template_injects_the_koni_system_prompt():
-    """The checkpoint's own template omits it, so serving would drop it silently."""
+def test_system_prompt_must_come_from_the_checkpoint():
+    """The default system prompt lives in the checkpoint, not here.
+
+    ``model.chat()`` injects it from the checkpoint's own ``conversation.py``, and the
+    model is trained with it. Serving must reproduce that — supply the checkpoint's
+    chat template (checkpoints ship one in ``chat_template.jinja``) rather than
+    hardcoding a prompt in this repository.
+    """
     from pathlib import Path
-
-    from jinja2 import Template
-
-    path = Path(__file__).parents[4] / "examples/template/koni_v.jinja"
-    tpl = Template(path.read_text(encoding="utf-8"))
-
-    out = tpl.render(messages=[{"role": "user", "content": "hi"}],
-                     add_generation_prompt=True)
-    assert out.startswith("<|im_start|>system\n")
-    assert "KONI-V" in out
-
-    # An explicit system message from the caller must win.
-    out2 = tpl.render(
-        messages=[{"role": "system", "content": "You are X."},
-                  {"role": "user", "content": "hi"}],
-        add_generation_prompt=True)
-    assert out2.startswith("<|im_start|>system\nYou are X.")
-    assert "KONI-V" not in out2
+    root = Path(__file__).parents[4]
+    assert not (root / "examples/template").glob("*koni*"), (
+        "model-specific prompts do not belong in this repository")

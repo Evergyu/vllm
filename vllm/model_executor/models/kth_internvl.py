@@ -28,7 +28,7 @@ from .internvl import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from ._kth.kth_vision import has_kth, build_kth_vision, infer_extra_tokens
-from ._kth.koni_tiling import KoniInternVLImageProcessor, koni_target_ratios
+from ._kth.kth_tiling import KTHInternVLImageProcessor, kth_target_ratios
 
 # old checkpoints (KTH_720k, FullFT_*) name the modes llava_sp_*; v10 renamed them koni_*
 _SFM_ALIAS = {
@@ -50,14 +50,14 @@ class KTHInternvlProcessingInfo(InternVLProcessingInfo):
     def get_image_processor(self, **kwargs):
         """Use the reference harness's tie-break order when tiling.
 
-        See ``_kth/koni_tiling`` — upstream picks a different tied ratio, which
+        See ``_kth/kth_tiling`` — upstream picks a different tied ratio, which
         changes the tile count on ~10% of real benchmark images. Serving has to
         reproduce the published numbers.
         """
         proc = super().get_image_processor(**kwargs)
         if not has_kth(self.get_hf_config()):
             return proc
-        return KoniInternVLImageProcessor(
+        return KTHInternVLImageProcessor(
             image_size=proc.image_size,
             min_dynamic_patch=proc.min_dynamic_patch,
             max_dynamic_patch=proc.max_dynamic_patch,
@@ -82,7 +82,7 @@ class KTHInternvlProcessingInfo(InternVLProcessingInfo):
             ratios = _orig_resolve(*args, **kw)
             mn = min(a * b for a, b in ratios)
             mx = max(a * b for a, b in ratios)
-            return koni_target_ratios(mn, mx)
+            return kth_target_ratios(mn, mx)
 
         proc.resolve_target_ratios = _resolve
         return proc

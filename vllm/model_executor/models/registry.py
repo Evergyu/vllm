@@ -438,9 +438,9 @@ _MULTIMODAL_MODELS = {
     # routing every InternVL checkpoint here is safe and makes KTH servable without
     # editing each checkpoint's config.json.
     "InternVLChatModel": ("kth_internvl", "KTHInternvlChatModel"),
-    # KONI-V checkpoints declare their own architecture name. Same class: the
-    # vision tower is loaded from the checkpoint either way.
-    "KoniVChatModel": ("kth_internvl", "KTHInternvlChatModel"),
+    # Newer KTH checkpoints declare their own architecture name. Same class: the
+    # vision tower is loaded from the checkpoint through auto_map either way.
+    "KTHChatModel": ("kth_internvl", "KTHInternvlChatModel"),
     "KTHInternvlChatModel": ("kth_internvl", "KTHInternvlChatModel"),
     "InternS1ForConditionalGeneration": (
         "interns1",

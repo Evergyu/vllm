@@ -25,7 +25,6 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-from .configuration_internvl_chat import InternVLChatConfig
 
 
 class _StubLLM(nn.Module):
@@ -67,9 +66,8 @@ def load_kth_class(model_path: str | None, config=None):
     ``get_class_from_dynamic_module`` resolves either form (downloading the module
     from the Hub when needed).
 
-    Falls back to the vendored copy only when the checkpoint ships no remote code.
-    That path is a hazard — it is how the model silently loses its spatial modules —
-    so it warns.
+    Raises if the checkpoint ships no remote code: there is deliberately no vendored
+    fallback, because a stale copy loses the spatial modules without any error.
     """
     ref = None
     if config is not None:
@@ -85,17 +83,15 @@ def load_kth_class(model_path: str | None, config=None):
         _apply_tf_compat(cls)
         return cls
 
-    logger.warning(
-        "KTH: no remote modeling code found for %r — falling back to the vendored "
-        "copy under _kth/. That copy can be older than the checkpoint, in which case "
-        "the spatial modules are not built and their weights are dropped without an "
-        "error. Ship modeling_internvl_chat.py with the checkpoint.", model_path)
-    from . import _orig_modeling as _fallback
-    _apply_tf_compat(_fallback.InternVLChatModel)
-    return _fallback.InternVLChatModel
+    raise ValueError(
+        f"No remote modeling code found for {model_path!r}. This model class runs the "
+        "checkpoint's own vision tower, so the checkpoint must ship "
+        "modeling_*.py and declare it in config.json's auto_map. There is no vendored "
+        "fallback on purpose: a copy goes stale, and when it does the spatial modules "
+        "are silently not built and their weights are dropped without an error.")
 
 
-def build_kth_vision(config: InternVLChatConfig, model_path: str | None = None) -> nn.Module:
+def build_kth_vision(config, model_path: str | None = None) -> nn.Module:
     """Build the modified vision tower on the meta device (weights filled by vLLM).
 
     The returned module owns ``vision_model`` / ``mlp1`` / the spatial modules; its
