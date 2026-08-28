@@ -107,8 +107,8 @@ def test_internvl_arch_routes_to_kth():
     to the KTH class (which falls back to stock behaviour for plain InternVL).
     """
     from vllm.model_executor.models.registry import _MULTIMODAL_MODELS
-    assert _MULTIMODAL_MODELS["InternVLChatModel"] == (
-        "kth_internvl", "KTHInternvlChatModel")
+    for arch in ("InternVLChatModel", "KoniVChatModel"):
+        assert _MULTIMODAL_MODELS[arch] == ("kth_internvl", "KTHInternvlChatModel"), arch
 
 
 # ---------------------------------------------------------------- tiling parity

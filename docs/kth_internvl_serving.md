@@ -26,9 +26,13 @@ their own.
 `--trust-remote-code` is required: the vision tower class is loaded from the
 checkpoint's own `modeling_internvl_chat.py` at runtime.
 
-No `config.json` edit is needed. These checkpoints declare
-`architectures: ["InternVLChatModel"]`, and that name routes here; a plain InternVL
-checkpoint (no `spatial_feature_mode`) falls through to stock behaviour unchanged.
+No `config.json` edit is needed. Both `architectures: ["InternVLChatModel"]` (older
+checkpoints) and `["KoniVChatModel"]` (the published KONI-V repos) route here. A plain
+InternVL checkpoint — one whose config declares no `spatial_feature_mode` — falls
+through to stock behaviour unchanged.
+
+The vision tower comes from the checkpoint's own remote code either way, so the class
+names inside it do not matter: `auto_map` is what is followed.
 
 `LOCAL_BRANCH` selects the cropping branch and **must match training**. It is read by
 the checkpoint's own code, and it changes the per-tile token count, so a mismatch
