@@ -15,6 +15,7 @@ For plain InternVL configs the same class falls back to stock vLLM behavior.
 """
 import os
 from collections.abc import Iterable
+from dataclasses import replace
 
 from vllm.platforms import current_platform
 
@@ -90,8 +91,50 @@ class KTHInternvlProcessingInfo(InternVLProcessingInfo):
         return proc
 
 
+# Tile budget shared across the images of one request. The reference harness
+# (`lmms_eval/models/simple/internvl3.py`, `max_num=12`, `total_max_num=64`) applies it
+# per request in the KTH wrapper:
+#
+#     dyn = max(1, min(max_num, total_max_num // n_images))
+#
+# Upstream vLLM gives *every* image the full `max_dynamic_patch`, so on an 8-page
+# document the reference tiles each page into at most 8 tiles while vLLM would use 12.
+# The published numbers were measured with the reference budget; serving has to
+# reproduce it. For 1-5 images the two agree (64 // 5 = 12), so single-image
+# benchmarks are untouched.
+_KTH_TOTAL_MAX_NUM = int(os.environ.get("KTH_TOTAL_MAX_NUM", "64"))
+
+
+class KTHInternVLMultiModalProcessor(InternVLMultiModalProcessor):
+    """Share one tile budget across the images of a request, as the reference does.
+
+    The cap is injected into ``hf_processor_mm_kwargs`` **once**, at the entry point,
+    so the pixel tiling and the placeholder count are both derived from it. Setting it
+    in only one of the two paths desyncs image tokens from tiles.
+    """
+
+    def apply(self, inputs, *args, **kwargs):
+        items = inputs.mm_data_items.get("image")
+        n = len(items) if items is not None else 0
+        # An explicit per-request `max_dynamic_patch` from the caller wins.
+        if n > 1 and "max_dynamic_patch" not in inputs.hf_processor_mm_kwargs:
+            config = self.info.get_hf_config()
+            if has_kth(config):
+                mx = int(getattr(config, "max_dynamic_patch", 12) or 12)
+                dyn = max(1, min(mx, _KTH_TOTAL_MAX_NUM // n))
+                if dyn < mx:
+                    inputs = replace(
+                        inputs,
+                        hf_processor_mm_kwargs={
+                            **inputs.hf_processor_mm_kwargs,
+                            "max_dynamic_patch": dyn,
+                        },
+                    )
+        return super().apply(inputs, *args, **kwargs)
+
+
 @MULTIMODAL_REGISTRY.register_processor(
-    InternVLMultiModalProcessor,
+    KTHInternVLMultiModalProcessor,
     info=KTHInternvlProcessingInfo,
     dummy_inputs=InternVLDummyInputsBuilder,
 )
