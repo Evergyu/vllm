@@ -339,10 +339,12 @@ class InternVLProcessingInfo(BaseInternVLProcessingInfo):
         config = self.get_hf_config()
         vision_config = config.vision_config
 
-        kwargs = self.ctx.get_merged_mm_kwargs(kwargs)
-        kwargs.setdefault("image_size", vision_config.image_size)
-
-        return InternVLVideoProcessor(**kwargs)
+        # ``max_dynamic_patch``/tiling options belong to the image processor.
+        # The stock InternVL video processor intentionally accepts only
+        # ``image_size``; forwarding the merged image kwargs makes model
+        # initialization fail with ``unexpected keyword argument
+        # 'max_dynamic_patch'`` as soon as a video-capable processor is built.
+        return InternVLVideoProcessor(image_size=vision_config.image_size)
 
     @cached_property
     def ctx_video_token(self):
