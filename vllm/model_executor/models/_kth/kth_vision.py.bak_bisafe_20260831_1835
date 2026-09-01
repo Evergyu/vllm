@@ -91,87 +91,6 @@ def load_kth_class(model_path: str | None, config=None):
         "are silently not built and their weights are dropped without an error.")
 
 
-def _make_batch_invariant_safe(m) -> int:
-    """Route the vision attention through SDPA so ``VLLM_BATCH_INVARIANT`` can be used.
-
-    ``enable_batch_invariant_mode()`` overrides ``aten::softmax``/``aten::_softmax`` on
-    CUDA process-wide, and that implementation hits an illegal memory access on this
-    vision tower's attention shapes::
-
-        attn = attn.softmax(dim=-1)                     # modeling_intern_vit._naive_attn
-        input_max = torch.amax(input, dim=dim, ...)     # softmax_batch_invariant
-        torch.AcceleratorError: CUDA error: an illegal memory access was encountered
-
-    The reference pipeline never hits it: it runs the vision tower with HF in the
-    *main* process, so only the decoder (in EngineCore) sees the patch. Serving runs
-    vision inside EngineCore, so it does.
-
-    That matters for parity, not just for the crash — the reference harness turns the
-    flag on whenever it batches (``run_eval.sh``: GEN_BATCH>1 -> VLLM_BATCH_INVARIANT=1),
-    and its deterministic decode kernels are worth **+4.17 points on PRISMM pair_match**
-    (2026-08-31 실측: 래퍼 78.65 with, 74.48 without).
-
-    ``F.scaled_dot_product_attention`` is the same function without the explicit
-    ``aten::softmax`` call, so the patch cannot reach it. Applied only when the flag is
-    on — default runs are untouched. Returns how many modules were patched.
-    """
-    if os.environ.get("VLLM_BATCH_INVARIANT", "0") not in ("1", "true", "True"):
-        return 0
-    import torch.nn.functional as _F
-
-    def _sdpa_attn(self, x):
-        B, N, C = x.shape
-        qkv = (self.qkv(x)
-               .reshape(B, N, 3, self.num_heads, C // self.num_heads)
-               .permute(2, 0, 3, 1, 4))
-        q, k, v = qkv.unbind(0)
-        if getattr(self, "qk_normalization", False):
-            B_, H_, N_, D_ = q.shape
-            q = self.q_norm(q.transpose(1, 2).flatten(-2, -1)).view(B_, N_, H_, D_).transpose(1, 2)
-            k = self.k_norm(k.transpose(1, 2).flatten(-2, -1)).view(B_, N_, H_, D_).transpose(1, 2)
-        o = _F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, scale=self.scale)
-        o = o.transpose(1, 2).reshape(B, N, C)
-        return self.proj_drop(self.proj(o))
-
-    seen, n = set(), 0
-    for mod in m.modules():
-        cls = type(mod)
-        if cls in seen or not hasattr(cls, "_naive_attn"):
-            continue
-        seen.add(cls)
-        if getattr(cls, "_kth_bi_safe", False):
-            continue
-        cls._naive_attn = _sdpa_attn
-        cls._kth_bi_safe = True
-        n += 1
-
-    # ``mean_batch_invariant`` returns float32 unconditionally
-    # (``result = input.to(torch.float32)``), so the spatial module's pooled tensor
-    # arrives at a bf16 ``Linear`` and torch raises
-    #     RuntimeError: mat1 and mat2 must have the same dtype, but got Float and BFloat16
-    # (``sfe_channel_fc(gap)`` in the global_ca channel attention).
-    # Coerce Linear inputs to the weight dtype; a no-op when they already match.
-    import torch.nn as _nn
-    k = 0
-    for mod in m.modules():
-        if not isinstance(mod, _nn.Linear) or getattr(mod, "_kth_bi_cast", False):
-            continue
-        _orig = mod.forward
-
-        def _fwd(x, _o=_orig, _m=mod):
-            if x.dtype != _m.weight.dtype:
-                x = x.to(_m.weight.dtype)
-            return _o(x)
-
-        mod.forward = _fwd
-        mod._kth_bi_cast = True
-        k += 1
-    if n or k:
-        logger.info("KTH: VLLM_BATCH_INVARIANT compat — attention->SDPA (%d class), "
-                    "Linear dtype-coerce (%d module)", n, k)
-    return n
-
-
 def build_kth_vision(config, model_path: str | None = None) -> nn.Module:
     """Build the modified vision tower on the meta device (weights filled by vLLM).
 
@@ -184,7 +103,6 @@ def build_kth_vision(config, model_path: str | None = None) -> nn.Module:
     with torch.device("meta"):
         m = cls(config, language_model=stub, use_flash_attn=False)
     m.language_model = None  # drop the stub so it is excluded from weight loading
-    _make_batch_invariant_safe(m)
     return m
 
 

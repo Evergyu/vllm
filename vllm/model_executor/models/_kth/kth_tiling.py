@@ -1,4 +1,4 @@
-"""Tiling that reproduces the KONI-V reference pipeline exactly.
+"""Tiling that reproduces the KTH reference pipeline exactly.
 
 ## Why this exists
 
@@ -14,7 +14,7 @@ therefore depends on the iteration order of the candidate container.
 Those disagree on real images — 14.0% of a 300-image ChartQA sample and 9.3% of DocVQA
 get a different tile count, in both directions (8->2 blocks on some, 2->8 on others).
 
-Every published KONI-V number — the HF ``model.chat()`` reference included, since it
+Every published KTH number — the HF ``model.chat()`` reference included, since it
 shares the harness front-end — was produced with the ``set`` ordering. Serving must
 reproduce those numbers, so this module reproduces that ordering rather than the
 upstream one. It does so by **constructing the container the same way** instead of
@@ -38,7 +38,7 @@ from vllm.transformers_utils.processors.internvl import (
 )
 
 
-def koni_target_ratios(min_num: int, max_num: int) -> set[tuple[int, int]]:
+def kth_target_ratios(min_num: int, max_num: int) -> set[tuple[int, int]]:
     """Candidate ratios in the reference harness's iteration order.
 
     Deliberately returns the ``set`` itself: the tie-break depends on iteration
@@ -54,7 +54,7 @@ def koni_target_ratios(min_num: int, max_num: int) -> set[tuple[int, int]]:
     }
 
 
-def koni_image_to_pixel_values(
+def kth_image_to_pixel_values(
     image: Image.Image,
     *,
     input_size: int,
@@ -64,7 +64,7 @@ def koni_image_to_pixel_values(
 ) -> torch.Tensor:
     tiles = dynamic_preprocess_internvl(
         image,
-        target_ratios=koni_target_ratios(min_num, max_num),
+        target_ratios=kth_target_ratios(min_num, max_num),
         image_size=input_size,
         use_thumbnail=use_thumbnail,
     )
@@ -72,7 +72,7 @@ def koni_image_to_pixel_values(
     return torch.stack([transform(t) for t in tiles])
 
 
-class KoniInternVLImageProcessor(InternVLImageProcessor):
+class KTHInternVLImageProcessor(InternVLImageProcessor):
     """``InternVLImageProcessor`` with the reference harness's tie-break order."""
 
     def _images_to_pixel_values_lst(
@@ -93,11 +93,11 @@ class KoniInternVLImageProcessor(InternVLImageProcessor):
             min_dynamic_patch=min_dynamic_patch,
             max_dynamic_patch=max_dynamic_patch,
             dynamic_image_size=dynamic_image_size,
-            use_thumbnail=False,  # applied inside koni_image_to_pixel_values
+            use_thumbnail=False,  # applied inside kth_image_to_pixel_values
         )
 
         return [
-            koni_image_to_pixel_values(
+            kth_image_to_pixel_values(
                 image,
                 input_size=self.image_size,
                 min_num=min_num,
