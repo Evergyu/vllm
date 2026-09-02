@@ -233,7 +233,7 @@ def main() -> int:
     ap.add_argument("--local-branch", default="global_ca")
     ap.add_argument("--check", default="a,b,c")
     ap.add_argument("--wrapper-repo", default=None,
-                    help="lmms-eval-for-KONI src dir; if given, import the real "
+                    help="reference harness src dir; if given, import the real "
                          "reference load_image instead of the transcription here")
     args = ap.parse_args()
 

@@ -3,8 +3,9 @@
 **The modeling code is loaded from the checkpoint itself, never vendored.**
 
 These checkpoints ship their own ``modeling_internvl_chat.py`` (HF remote code) and
-it keeps changing: the spatial-feature modes were renamed ``llava_sp_*`` -> ``koni_*``,
-the content-aware gate was replaced, and the cropping branch became selectable via the
+it keeps changing: the spatial-feature modes were renamed from the ``llava_sp_*``
+spelling to the current one (see ``SPATIAL_MODE_ALIASES`` below), the content-aware
+gate was replaced, and the cropping branch became selectable via the
 ``LOCAL_BRANCH`` env var. A vendored copy silently goes stale — and because the token
 bookkeeping stays self-consistent, the model then loads, runs, and answers with the
 whole spatial contribution missing and no error anywhere.
@@ -24,6 +25,27 @@ import torch.nn as nn
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# SINGLE SOURCE OF TRUTH for the checkpoint-side spatial-mode vocabulary.
+#
+# These are NOT vLLM's names. ``spatial_feature_mode`` is written into the
+# checkpoint's ``config.json`` by the training stack, and the checkpoint's own
+# remote code dispatches on it. The strings below must therefore match that data
+# byte-for-byte — renaming them here without re-exporting the checkpoints makes
+# every affected checkpoint fail to load with "Unsupported spatial_feature_mode".
+#
+# The v10 training run renamed the modes; checkpoints produced before it still
+# carry the older ``llava_sp_*`` spelling, so we map old -> current.
+#
+# TO RE-BRAND: change the three values on the right-hand side here and nothing
+# else. This dict is the only place they appear in the tree.
+# ---------------------------------------------------------------------------
+SPATIAL_MODE_ALIASES = {
+    "llava_sp_both": "koni_token_hier",
+    "llava_sp_pooling": "koni_pool",
+    "llava_sp_cropping": "koni_crop",
+}
 
 
 
@@ -198,9 +220,7 @@ def infer_extra_tokens(config, model_path: str | None = None) -> int:
     """
     cls = load_kth_class(model_path, config)
     raw = getattr(config, "spatial_feature_mode", "none")
-    alias = {"llava_sp_both": "koni_token_hier",
-             "llava_sp_pooling": "koni_pool",
-             "llava_sp_cropping": "koni_crop"}
+    alias = SPATIAL_MODE_ALIASES
 
     class _Shim:
         pass
@@ -209,11 +229,11 @@ def infer_extra_tokens(config, model_path: str | None = None) -> int:
     shim.config = config
     # --- 2026-08-31: 구세대 KTH 체크포인트 호환 (수정 2곳 중 1) -------------------
     # 이 shim 은 체크포인트 자체 코드를 끌어다 쓰는데, 그 코드에 세대가 둘 있다.
-    #   신(예: localfix_e6t_...): mode=koni_*        · _local_token_count 있음
+    #   신(예: localfix_e6t_...): mode=현행명(SPATIAL_MODE_ALIASES 의 값) · _local_token_count 있음
     #   구(예: KTH_FullFT_20260529_2053, KTH_720k_s2only_20260708_1215):
     #        mode=llava_sp_*  · _local_token_count 없음 · LOCAL_BRANCH 참조 0곳
     # 구 코드의 _infer_extra_tokens 는 원래 llava_sp_* 이름으로 분기한다. 별칭을
-    # 씌워 주면 "Unsupported spatial_feature_mode: koni_token_hier" 로 죽는다.
+    # 씌워 주면 "Unsupported spatial_feature_mode: <현행명>" 으로 죽는다.
     # 따라서 별칭 변환은 신 코드일 때만 한다. (구 llava_sp_both -> extra=12, 268)
     _is_new = hasattr(cls, "_local_token_count")
     shim.spatial_feature_mode = alias.get(raw, raw) if _is_new else raw

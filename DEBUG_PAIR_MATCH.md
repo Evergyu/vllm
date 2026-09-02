@@ -5,7 +5,7 @@ checkpoint**, on a 4-way multiple-choice multi-image benchmark. Every input we k
 to compare has been measured identical. This document is a request for review: what is
 left?
 
-- **Branch:** `debug/pair-match-minus14` (off `feat/koni-v`, HEAD `25ae4b95`)
+- **Branch:** `debug/pair-match-minus14` (HEAD `25ae4b95`)
 - **Build under test:** vLLM `0.1.dev7+g1be9ea959` (recent `main`, DeepSeek-V4/KDA-era code),
   installed into a separate conda env, with a custom model shim registered for
   `InternVLChatModel`.
@@ -182,7 +182,7 @@ Excerpts are quoted verbatim from the **installed** copies — the exact code th
 produced the numbers above. Original absolute paths and line numbers are in the comment
 at the top of each block.
 
-> Note on this branch: the checkout carries `_kth/koni_tiling.py`, while the installed
+> Note on this branch: the checkout carries `_kth/kth_tiling.py`, while the installed
 > build under measurement has the same code as `_kth/kth_tiling.py`. The file was
 > renamed; the excerpts below are from the installed (measured) copies.
 
@@ -191,7 +191,7 @@ at the top of each block.
 `vllm/model_executor/models/kth_internvl.py`
 
 ```python
-# /…/envs/koni_fork/lib/python3.11/site-packages/vllm/model_executor/models/kth_internvl.py:92-127
+# /…/envs/<env>/lib/python3.11/site-packages/vllm/model_executor/models/kth_internvl.py:92-127
     def get_hf_processor(self, **kwargs) -> InternVLProcessor:
         proc = super().get_hf_processor(**kwargs)
         config = self.get_hf_config()
@@ -424,7 +424,7 @@ For reference, the base per-tile token count that the shim adds +12 to:
 
 ### 4.5 Reference wrapper — prompt build (Path A)
 
-External repo (`lmms-eval-for-KONI`), included here because it is the definition of
+External harness repo, included here because it is the definition of
 "correct".
 
 ```python

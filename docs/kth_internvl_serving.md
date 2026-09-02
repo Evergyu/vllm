@@ -13,11 +13,11 @@ attention, prefix caching, OpenAI-compatible API.
 export LOCAL_BRANCH=global_ca          # must match training
 vllm serve /path/to/checkpoint \
     --trust-remote-code \
-    --chat-template examples/template/koni_v.jinja
+    --chat-template examples/template/kth_internvl.jinja
 ```
 
 `--chat-template` matters. The checkpoint's own `chat_template.jinja` injects **no**
-system message, but `model.chat()` — the reference path — always supplies the KONI-V
+system message, but `model.chat()` — the reference path — always supplies the
 identity prompt from `conversation.py`, and the model was SFT'd with it. Without this
 flag a request that carries no system message is served in a state the model never saw
 in training. The shipped template injects it and steps aside when the caller sends
@@ -46,7 +46,8 @@ desyncs the image placeholders:
 ## Why the modeling code is not vendored
 
 It used to be, and it went stale. The checkpoints renamed `spatial_feature_mode` from
-`llava_sp_*` to `koni_*`, replaced the content-aware gate
+`llava_sp_*` to the current spelling (`_kth/kth_vision.py:SPATIAL_MODE_ALIASES`),
+replaced the content-aware gate
 (`σ(W·pool+b)` → `σ(τ·cos(w, LN(pool))+b)`), and added the `LOCAL_BRANCH` branch.
 Against a current checkpoint the vendored copy:
 
@@ -85,8 +86,8 @@ container. Upstream vLLM sorts by block count; the harness passes a `set`. On a
 300-image sample they differ on 14.0% of ChartQA and 9.3% of DocVQA images, in both
 directions — a 1000x1000 image is 1 tile under the harness and 9 upstream.
 
-Every published KONI-V number was measured with the harness order, so
-`_kth/koni_tiling.py` reproduces that order (by building the container the same way,
+Every published number was measured with the harness order, so
+`_kth/kth_tiling.py` reproduces that order (by building the container the same way,
 not by freezing a hash order). If the reference pipeline ever changes, this follows.
 
 ## Note on `async_scheduling`

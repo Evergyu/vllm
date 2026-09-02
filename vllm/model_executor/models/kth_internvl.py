@@ -33,12 +33,8 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from ._kth.kth_vision import has_kth, build_kth_vision, infer_extra_tokens
 from ._kth.kth_tiling import KTHInternVLImageProcessor, kth_target_ratios
 
-# old checkpoints (KTH_720k, FullFT_*) name the modes llava_sp_*; v10 renamed them koni_*
-_SFM_ALIAS = {
-    "llava_sp_both": "koni_token_hier",
-    "llava_sp_pooling": "koni_pool",
-    "llava_sp_cropping": "koni_crop",
-}
+# The old -> current spatial-mode mapping lives in one place only:
+# ``._kth.kth_vision.SPATIAL_MODE_ALIASES``. Do not re-declare it here.
 
 
 def _kth_extra_tokens(config, model_path: str | None = None) -> int:

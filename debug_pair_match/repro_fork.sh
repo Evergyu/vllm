@@ -35,7 +35,7 @@ export LOCAL_BRANCH="${LOCAL_BRANCH:-global_ca}"
 # gets it via get_conv_template(); the fork only sees jinja. Generate a template with
 # the system message injected -- per checkpoint, never hardcoded.
 #   python eval/_src/make_fork_template.py <CKPT> --verify
-CHAT_TEMPLATE="${CHAT_TEMPLATE:-$FORK/templates/koni_sys.jinja}"
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-$FORK/templates/system.jinja}"  # override per checkpoint
 
 # Toggle these to reproduce the knob sweep in DEBUG_PAIR_MATCH.md 2 (all within noise):
 #   export VLLM_BATCH_INVARIANT=1     # -> 64.06

@@ -2,7 +2,8 @@
 
 The bug this pins. The extra-token count was hardcoded from the ``llava_sp_*`` mode
 names and the modeling code was vendored under ``_kth/``. Checkpoints later renamed
-those modes to ``koni_*``, replaced the content-aware gate, and made the cropping
+those modes (see ``kth_vision.SPATIAL_MODE_ALIASES``), replaced the content-aware
+gate, and made the cropping
 branch selectable through the ``LOCAL_BRANCH`` env var. The vendored copy went stale,
 so on a current checkpoint the count came out 0, the spatial modules were never built,
 and their weights were dropped — while the token bookkeeping stayed self-consistent.
@@ -17,7 +18,12 @@ import os
 import pytest
 
 from vllm.model_executor.models._kth import kth_vision
+from vllm.model_executor.models._kth.kth_vision import SPATIAL_MODE_ALIASES
 from vllm.model_executor.models.kth_internvl import _kth_extra_tokens
+
+# Current checkpoint-side name for the token-hierarchy mode. Read from the single
+# source of truth so a rename there needs no edit here.
+TOKEN_HIER = SPATIAL_MODE_ALIASES["llava_sp_both"]
 
 
 class _Cfg:
@@ -46,16 +52,16 @@ class _Cfg:
         ("dense_8x8", 70),     # 6 + 64
     ],
 )
-def test_koni_token_hier_follows_local_branch(monkeypatch, local_branch, expected):
+def test_token_hier_mode_follows_local_branch(monkeypatch, local_branch, expected):
     monkeypatch.setenv("LOCAL_BRANCH", local_branch)
-    assert _kth_extra_tokens(_Cfg("koni_token_hier")) == expected
+    assert _kth_extra_tokens(_Cfg(TOKEN_HIER)) == expected
 
 
 def test_legacy_llava_sp_names_are_aliased(monkeypatch):
-    """Pre-rename checkpoints must resolve to the same count as their koni_* name."""
+    """Pre-rename checkpoints must resolve to the same count as the current name."""
     monkeypatch.setenv("LOCAL_BRANCH", "center_crop")
     assert _kth_extra_tokens(_Cfg("llava_sp_both")) == _kth_extra_tokens(
-        _Cfg("koni_token_hier"))
+        _Cfg(TOKEN_HIER))
 
 
 def test_plain_internvl_gets_no_extra_tokens():
@@ -66,7 +72,7 @@ def test_unknown_local_branch_is_rejected(monkeypatch):
     """Silently guessing a token count would desync the image placeholders."""
     monkeypatch.setenv("LOCAL_BRANCH", "not_a_real_branch")
     with pytest.raises(ValueError, match="LOCAL_BRANCH"):
-        _kth_extra_tokens(_Cfg("koni_token_hier"))
+        _kth_extra_tokens(_Cfg(TOKEN_HIER))
 
 
 def test_class_is_loaded_from_the_checkpoint(tmp_path, monkeypatch):
@@ -124,7 +130,7 @@ def _harness_ratios(min_num: int, max_num: int):
 
 
 def test_tiling_matches_the_reference_harness():
-    """Tie-breaks must resolve the way every published KONI-V number was measured.
+    """Tie-breaks must resolve the way every published number was measured.
 
     ``find_closest_aspect_ratio`` picks the last tied candidate that passes the area
     test, so the iteration order decides the tile count. Upstream sorts by block
@@ -133,7 +139,7 @@ def test_tiling_matches_the_reference_harness():
     """
     from PIL import Image
 
-    from vllm.model_executor.models._kth.koni_tiling import koni_target_ratios
+    from vllm.model_executor.models._kth.kth_tiling import kth_target_ratios
     from vllm.transformers_utils.processors.internvl import (
         dynamic_preprocess_internvl,
         get_internvl_target_ratios,
@@ -144,8 +150,8 @@ def test_tiling_matches_the_reference_harness():
     upstream_differs = 0
     for w, h in sizes:
         img = Image.new("RGB", (w, h))
-        koni = dynamic_preprocess_internvl(
-            img, target_ratios=koni_target_ratios(1, 12),
+        kth = dynamic_preprocess_internvl(
+            img, target_ratios=kth_target_ratios(1, 12),
             image_size=448, use_thumbnail=True)
         harness = dynamic_preprocess_internvl(
             img, target_ratios=_harness_ratios(1, 12),
@@ -154,7 +160,7 @@ def test_tiling_matches_the_reference_harness():
             img, target_ratios=get_internvl_target_ratios(1, 12),
             image_size=448, use_thumbnail=True)
 
-        assert len(koni) == len(harness), (w, h, len(koni), len(harness))
+        assert len(kth) == len(harness), (w, h, len(kth), len(harness))
         if len(upstream) != len(harness):
             upstream_differs += 1
 
@@ -167,28 +173,28 @@ def test_square_image_tiles_like_the_harness():
     """The clearest single case: a large square image is one tile, not nine."""
     from PIL import Image
 
-    from vllm.model_executor.models._kth.koni_tiling import koni_target_ratios
+    from vllm.model_executor.models._kth.kth_tiling import kth_target_ratios
     from vllm.transformers_utils.processors.internvl import dynamic_preprocess_internvl
 
     tiles = dynamic_preprocess_internvl(
-        Image.new("RGB", (1000, 1000)), target_ratios=koni_target_ratios(1, 12),
+        Image.new("RGB", (1000, 1000)), target_ratios=kth_target_ratios(1, 12),
         image_size=448, use_thumbnail=True)
     assert len(tiles) == 1
 
 
-def test_chat_template_injects_the_koni_system_prompt():
+def test_chat_template_injects_the_default_system_prompt():
     """The checkpoint's own template omits it, so serving would drop it silently."""
     from pathlib import Path
 
     from jinja2 import Template
 
-    path = Path(__file__).parents[4] / "examples/template/koni_v.jinja"
+    path = Path(__file__).parents[4] / "examples/template/kth_internvl.jinja"
     tpl = Template(path.read_text(encoding="utf-8"))
 
     out = tpl.render(messages=[{"role": "user", "content": "hi"}],
                      add_generation_prompt=True)
     assert out.startswith("<|im_start|>system\n")
-    assert "KONI-V" in out
+    assert "system_message" in out  # placeholder is present until replaced
 
     # An explicit system message from the caller must win.
     out2 = tpl.render(
@@ -196,4 +202,4 @@ def test_chat_template_injects_the_koni_system_prompt():
                   {"role": "user", "content": "hi"}],
         add_generation_prompt=True)
     assert out2.startswith("<|im_start|>system\nYou are X.")
-    assert "KONI-V" not in out2
+    assert "system_message" not in out2
